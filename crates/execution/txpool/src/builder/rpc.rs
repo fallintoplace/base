@@ -6,7 +6,7 @@ use alloy_primitives::TxHash;
 use base_bundles::MeterBundleResponse;
 use base_common_consensus::BaseTransactionSigned;
 use base_observability_events::{
-    EventOccurrence, TransactionEventProducer, TransactionEventType, transaction_event,
+    TransactionEventProducer, TransactionEventType, transaction_event,
 };
 use jsonrpsee::{
     core::RpcResult,
@@ -210,9 +210,6 @@ where
 
 impl<P, E> BuilderApiImpl<P, E> {
     /// Records the outcome of one `base_insertValidatedTransaction` call.
-    ///
-    /// Forwarders resend the same transaction on separate calls and from several nodes, and
-    /// each call has its own outcome, so the event ID carries a per-emission occurrence.
     fn emit_validated_insert_event(
         &self,
         event_type: TransactionEventType,
@@ -226,10 +223,6 @@ impl<P, E> BuilderApiImpl<P, E> {
             producer: TransactionEventProducer::BaseBuilder,
             event_type: event_type,
             tx_hash: tx_hash,
-            occurrence: EventOccurrence::next(),
-            id: {
-                "tx_hash" => format!("{tx_hash:#x}"),
-            },
             data: data,
         );
     }
