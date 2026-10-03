@@ -3,7 +3,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use alloy_primitives::Address;
-use base_batcher_core::ThrottleConfig;
+use base_batcher_core::{ThrottleConfig, ThrottleController, ThrottleStrategy};
 use base_batcher_encoder::EncoderConfig;
 use base_tx_manager::{SignerConfig, TxManagerConfig};
 use url::Url;
@@ -60,6 +60,9 @@ pub struct BatcherConfig {
     ///
     /// Must be `None` when [`shadow`](Self::shadow) is set.
     pub throttle: Option<ThrottleConfig>,
+    /// How the throttle intensity grows with the DA backlog, unused when
+    /// [`throttle`](Self::throttle) is `None`.
+    pub throttle_strategy: ThrottleStrategy,
     /// Number of recent L1 blocks to inspect for a confirmed batcher transaction.
     ///
     /// When [`wait_node_sync`](Self::wait_node_sync) is enabled, recent batcher
@@ -113,6 +116,7 @@ impl Default for BatcherConfig {
             max_pending_transactions: 1,
             tx_manager: TxManagerConfig { num_confirmations: 1, ..TxManagerConfig::default() },
             throttle: Some(ThrottleConfig::default()),
+            throttle_strategy: ThrottleStrategy::Linear,
             check_recent_txs_depth: 0,
             admin_addr: None,
             stopped: false,
@@ -120,6 +124,16 @@ impl Default for BatcherConfig {
             wait_node_sync_timeout: Duration::from_secs(600),
             force_blobs_when_throttling: true,
         }
+    }
+}
+
+impl BatcherConfig {
+    /// The throttle controller the batcher starts with: [`throttle_strategy`](Self::throttle_strategy)
+    /// over [`throttle`](Self::throttle), or one that never throttles when `throttle` is `None`.
+    pub fn throttle_controller(&self) -> ThrottleController {
+        self.throttle.clone().map_or_else(ThrottleController::disabled, |config| {
+            ThrottleController::new(config, self.throttle_strategy.clone())
+        })
     }
 }
 
@@ -164,6 +178,20 @@ mod tests {
 
     const CANONICAL_INBOX: Address = Address::repeat_byte(0xca);
     const SHADOW_INBOX: Address = Address::repeat_byte(0x5a);
+
+    /// The batcher starts with the configured throttle strategy, and never throttles when the
+    /// throttle is disabled.
+    #[test]
+    fn throttle_controller_follows_the_configured_strategy() {
+        let quadratic = BatcherConfig {
+            throttle_strategy: ThrottleStrategy::Quadratic,
+            ..BatcherConfig::default()
+        };
+        let disabled = BatcherConfig { throttle: None, ..quadratic.clone() };
+
+        assert_eq!(*quadratic.throttle_controller().strategy(), ThrottleStrategy::Quadratic);
+        assert_eq!(*disabled.throttle_controller().strategy(), ThrottleStrategy::Off);
+    }
 
     /// A shadow config accepts the shadow inbox as the batch inbox of the parity validator's
     /// rollup config, and refuses another one.

@@ -28,6 +28,7 @@ thiserror = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive", "std"] }
 alloy-primitives = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+clap = { workspace = true, features = ["derive"], optional = true }
 derive_more = { workspace = true, features = ["debug"] }
 
 # optional — activated by the `test-utils` feature
@@ -65,6 +66,7 @@ name = "stop_start"
 required-features = ["test-utils"]
 
 [features]
+clap = [ "dep:clap" ]
 metrics = [ "base-batcher-encoder/metrics", "base-tx-manager/metrics" ]
 test-utils = [
 	"base-protocol/test-utils",

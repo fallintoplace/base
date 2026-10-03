@@ -12,8 +12,10 @@ pub struct ThrottleConfig {
     /// Backlog threshold in bytes at which throttling activates.
     /// Default: 1,000,000 bytes (1 MB).
     pub threshold_bytes: u64,
-    /// Maximum throttle intensity (0.0 to 1.0).
-    /// Default: 1.0 (full throttle at 2× threshold for [`ThrottleStrategy::Linear`]).
+    /// Maximum throttle intensity (0.0 to 1.0), reached from the threshold on with
+    /// [`ThrottleStrategy::Step`] and from twice the threshold on with
+    /// [`ThrottleStrategy::Linear`] and [`ThrottleStrategy::Quadratic`].
+    /// Default: 1.0 (full throttle).
     pub max_intensity: f64,
     /// Maximum block DA bytes allowed at full throttle intensity.
     /// Default: 2,000 bytes.
@@ -123,14 +125,19 @@ impl ThrottleParams {
 
 /// Strategy for calculating throttle intensity from DA backlog.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 #[serde(rename_all = "lowercase")]
 pub enum ThrottleStrategy {
-    /// No throttling.
+    /// No throttling: intensity 0 whatever the backlog.
     Off,
-    /// Step function: 0 below the threshold, `max_intensity` from the threshold on.
+    /// Intensity 0 below the threshold, and the maximum intensity from the threshold on.
     Step,
-    /// Linear interpolation between 0 and `max_intensity` based on backlog.
+    /// Intensity in proportion to the backlog above the threshold, up to the maximum intensity at
+    /// twice the threshold and beyond.
     Linear,
+    /// Intensity in proportion to the square of the backlog above the threshold, up to the
+    /// maximum intensity at twice the threshold and beyond, so below `linear` in between.
+    Quadratic,
 }
 
 /// Controls submission rate based on DA backlog.
@@ -199,8 +206,8 @@ impl ThrottleController {
     /// Update with current DA backlog bytes.
     ///
     /// Returns [`ThrottleParams`] if throttling should be applied, or `None`
-    /// if the backlog is below the threshold, the linear intensity is zero or the
-    /// strategy is [`ThrottleStrategy::Off`].
+    /// if the backlog is below the threshold, the linear or quadratic intensity is zero or
+    /// the strategy is [`ThrottleStrategy::Off`].
     pub fn update(&self, da_backlog_bytes: u64) -> Option<ThrottleParams> {
         match &self.strategy {
             ThrottleStrategy::Off => None,
@@ -213,16 +220,26 @@ impl ThrottleController {
                     None
                 }
             }
-            ThrottleStrategy::Linear => {
+            ThrottleStrategy::Linear | ThrottleStrategy::Quadratic => {
                 if da_backlog_bytes < self.config.threshold_bytes {
                     return None;
                 }
-                // Intensity grows linearly from 0 at the threshold to max_intensity at twice
-                // the threshold, and stays there above it.
+
+                // The linear factor goes from 0 at the threshold to 1 at twice the threshold, and
+                // stays at 1 above it.
                 let excess = da_backlog_bytes - self.config.threshold_bytes;
                 let range = self.config.threshold_bytes.max(1);
-                let ratio = (excess as f64 / range as f64).min(1.0);
-                let intensity = ratio * self.config.max_intensity;
+                let linear_factor = (excess as f64 / range as f64).min(1.0);
+
+                // The quadratic strategy squares it, which keeps 0 and 1 and lowers every value
+                // in between.
+                let intensity_factor = if self.strategy == ThrottleStrategy::Quadratic {
+                    linear_factor * linear_factor
+                } else {
+                    linear_factor
+                };
+                let intensity = intensity_factor * self.config.max_intensity;
+
                 // A zero intensity, at exactly the threshold or with a zero `max_intensity`, is no
                 // throttling, as below the threshold.
                 if intensity == 0.0 {
@@ -343,7 +360,7 @@ mod tests {
 
     use super::*;
 
-    /// The intensity and DA limits each strategy applies to a backlog, `None` meaning no
+    /// The intensity and DA limits each strategy computes for a backlog, `None` meaning no
     /// throttling.
     #[rstest]
     #[case::off(ThrottleStrategy::Off, 5000, None)]
@@ -359,6 +376,19 @@ mod tests {
     )]
     #[case::linear_above_twice_the_threshold(
         ThrottleStrategy::Linear,
+        5000,
+        Some((0.8, 27_600, 4_120))
+    )]
+    #[case::quadratic_below_threshold(ThrottleStrategy::Quadratic, 500, None)]
+    #[case::quadratic_at_threshold(ThrottleStrategy::Quadratic, 1000, None)]
+    #[case::quadratic_midpoint(ThrottleStrategy::Quadratic, 1500, Some((0.2, 104_400, 16_030)))]
+    #[case::quadratic_at_twice_the_threshold(
+        ThrottleStrategy::Quadratic,
+        2000,
+        Some((0.8, 27_600, 4_120))
+    )]
+    #[case::quadratic_above_twice_the_threshold(
+        ThrottleStrategy::Quadratic,
         5000,
         Some((0.8, 27_600, 4_120))
     )]
