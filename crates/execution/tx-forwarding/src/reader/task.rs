@@ -11,7 +11,7 @@ use base_execution_txpool::{
     ValidatedTransaction, ValidatedTransactionExtensions,
 };
 use base_observability_events::{
-    TransactionEventProducer, TransactionEventType, transaction_event,
+    EventOccurrence, TransactionEventProducer, TransactionEventType, transaction_event,
 };
 use reth_transaction_pool::{
     PoolTransaction, Priority, TransactionOrdering, TransactionPool, ValidPoolTransaction,
@@ -239,11 +239,17 @@ where
         }
     }
 
+    /// Records one hand-off of `tx_hash` to this destination's queue.
+    ///
+    /// Each hand-off is its own event: the same transaction is consumed once per destination and
+    /// again after `resend_after`, and `iterator_index` restarts with every snapshot, so the
+    /// event ID carries a per-emission occurrence.
     fn emit_builder_consumed_event(&self, tx_hash: TxHash, iterator_index: u64) {
         let _ = transaction_event!(
             producer: TransactionEventProducer::BaseRethNode,
             event_type: TransactionEventType::TxpoolBuilderConsumed,
             tx_hash: tx_hash,
+            occurrence: EventOccurrence::next(),
             id: {
                 "tx_hash" => format!("{tx_hash:#x}"),
                 "iterator_index" => iterator_index,
@@ -271,10 +277,13 @@ impl<P: TransactionPool, E> fmt::Debug for DestinationReader<P, E> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use alloy_consensus::transaction::Recovered;
     use alloy_primitives::{Address, B256, TxKind, U256};
     use base_common_consensus::{BaseTransactionSigned, TxDeposit};
     use base_execution_txpool::BasePooledTransaction;
+    use base_observability_events::TransactionEventCapture;
     use reth_transaction_pool::{
         TransactionOrigin, identifier::TransactionId, noop::NoopTransactionPool,
     };
@@ -316,6 +325,14 @@ mod tests {
         sender: mpsc::Sender<InsertValidatedTransaction>,
         cancel: CancellationToken,
     ) -> TestReader {
+        reader_for(sender, cancel, "http://builder.test")
+    }
+
+    fn reader_for(
+        sender: mpsc::Sender<InsertValidatedTransaction>,
+        cancel: CancellationToken,
+        builder_url: &str,
+    ) -> TestReader {
         DestinationReader::new(
             NoopTransactionPool::new(),
             ReaderConfig {
@@ -326,8 +343,22 @@ mod tests {
             },
             sender,
             cancel,
-            "http://builder.test".parse().unwrap(),
+            builder_url.parse().unwrap(),
         )
+    }
+
+    /// A one-transaction snapshot that places `transaction` at `iterator_index`.
+    fn snapshot(
+        transaction: Arc<ValidPoolTransaction<BasePooledTransaction>>,
+        iterator_index: u64,
+    ) -> Snapshot<BasePooledTransaction> {
+        let mut lanes = LaneScheduler::new();
+        let sequence = BestTransactionLane::for_transaction(&transaction);
+        let arrived = transaction.timestamp;
+        let priority = UnifiedTipOrdering::<BasePooledTransaction>::default()
+            .priority(&transaction.transaction, 0);
+        lanes.push((transaction, iterator_index), sequence, arrived, priority);
+        lanes
     }
 
     /// The wire form must carry the fields the builder RPC needs, or the queue would move
@@ -354,6 +385,43 @@ mod tests {
         assert!(matches!(reader.try_enqueue(&expected), Err(mpsc::error::TrySendError::Full(()))));
         assert_eq!(receiver.try_recv().unwrap().tx_hash, wire(0).tx_hash);
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// Each hand-off is a separate observation: the same transaction at the same iterator index
+    /// goes to several destinations, and to the same destination again after a later snapshot.
+    #[test]
+    fn builder_consumed_events_are_distinct_per_destination_and_scan() {
+        let capture = TransactionEventCapture::install();
+        let transaction = transaction(0xc1);
+        let tx_hash = *transaction.hash();
+        let (sender_a, mut receiver_a) = mpsc::channel(4);
+        let (sender_b, _receiver_b) = mpsc::channel(4);
+        let mut reader_a = reader_for(sender_a, CancellationToken::new(), "http://builder-a.test");
+        let mut reader_b = reader_for(sender_b, CancellationToken::new(), "http://builder-b.test");
+
+        assert_eq!(reader_a.fill_queue(&mut snapshot(Arc::clone(&transaction), 0)), Some(1));
+        assert_eq!(reader_b.fill_queue(&mut snapshot(Arc::clone(&transaction), 0)), Some(1));
+        receiver_a.try_recv().unwrap();
+        assert_eq!(reader_a.fill_queue(&mut snapshot(transaction, 0)), Some(1));
+
+        let events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == TransactionEventType::TxpoolBuilderConsumed
+                    && event.tx_hash == Some(tx_hash)
+            })
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.data["iterator_index"] == 0));
+        let urls: Vec<_> =
+            events.iter().map(|event| event.data["builder_url"].as_str().unwrap()).collect();
+        assert_eq!(
+            urls,
+            ["http://builder-a.test/", "http://builder-b.test/", "http://builder-a.test/"]
+        );
+        let ids: HashSet<_> = events.iter().map(|event| event.event_id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "each hand-off must keep its own event ID");
     }
 
     #[test]
