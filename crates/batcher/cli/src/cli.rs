@@ -23,12 +23,26 @@ pub struct BatcherArgs {
     #[arg(long = "l1-rpc-url", visible_aliases = ["l1", "l1-eth-rpc"], env = "BASE_NODE_L1_ETH_RPC")]
     pub l1_rpc_url: Url,
 
-    /// L2 HTTP RPC endpoint, the source of the unsafe blocks the batcher submits.
+    /// Sequencer endpoints, comma separated.
     ///
-    /// The DA limits are also pushed to this endpoint, so it must serve `miner_setMaxDASize`
-    /// unless `--no-throttle` is set. Otherwise the batcher stops.
-    #[arg(long = "l2-rpc-url", env = "BASE_BATCHER_L2_RPC_URL")]
-    pub l2_rpc_url: Url,
+    /// The batcher submits the unsafe blocks of the leader, read with
+    /// `eth_getBlockByNumber`. Among several endpoints, the leader is the one whose
+    /// `admin_sequencerActive` answers true. Outside shadow mode the batcher also reads
+    /// the rollup config of the leader (`optimism_rollupConfig`), follows its derivation
+    /// (`optimism_syncStatus`) and pushes the DA limits to every endpoint
+    /// (`miner_setMaxDASize`) unless `--no-throttle` is set. An endpoint that answers
+    /// method not found to `miner_setMaxDASize` stops the batcher.
+    ///
+    /// A conductor with its RPC proxy enabled serves all of them. So does a consensus
+    /// node started with `--rpc.execution-forwarding-endpoint`, and with
+    /// `--rpc.enable-admin` among several endpoints.
+    #[arg(
+        long = "sequencer-urls",
+        env = "BASE_BATCHER_SEQUENCER_URLS",
+        required = true,
+        value_delimiter = ','
+    )]
+    pub sequencer_urls: Vec<Url>,
 
     /// Optional L1 WebSocket endpoint for new-block subscriptions.
     ///
@@ -38,38 +52,42 @@ pub struct BatcherArgs {
     #[arg(long = "l1-ws-url", env = "BASE_BATCHER_L1_WS_URL")]
     pub l1_ws_url: Option<Url>,
 
-    /// Rollup node RPC endpoint.
-    ///
-    /// The batcher reads the rollup config of this node and follows its
-    /// derivation, so it posts to the batch inbox of that config, the inbox this
-    /// node derives its chain from. In shadow mode it is the parity validator's
-    /// rollup node.
-    #[arg(long = "rollup-rpc-url", env = "BASE_BATCHER_ROLLUP_RPC_URL")]
-    pub rollup_rpc_url: Url,
-
     /// Signer configuration.
     #[command(flatten)]
     pub signer: SignerCli,
 
     /// Run as a shadow batcher.
     ///
-    /// Must be set together with `--shadow.inbox` and
-    /// `--shadow.validator-l2-rpc-url`, so a canonical deployment cannot turn into
-    /// a shadow one by setting a single flag. Requires `--no-throttle`.
+    /// Must be set together with `--shadow.inbox`,
+    /// `--shadow.validator-rollup-rpc-url` and `--shadow.validator-l2-rpc-url`, so a
+    /// canonical deployment cannot turn into a shadow one by setting a single flag.
+    /// Requires `--no-throttle`.
     #[arg(long = "shadow.enabled", env = "BASE_BATCHER_SHADOW_ENABLED")]
     pub shadow_enabled: bool,
 
-    /// The shadow inbox, which must be the batch inbox of the `--rollup-rpc-url` node's config.
+    /// The shadow inbox, which must be the batch inbox of the parity validator's rollup config.
     #[arg(long = "shadow.inbox", env = "BASE_BATCHER_SHADOW_INBOX")]
     pub shadow_inbox: Option<Address>,
 
+    /// Parity validator rollup node RPC endpoint.
+    ///
+    /// A shadow batcher reads the rollup config of this node and follows its derivation,
+    /// so it posts to the batch inbox of that config, the inbox this node derives its
+    /// chain from.
+    #[arg(
+        long = "shadow.validator-rollup-rpc-url",
+        env = "BASE_BATCHER_SHADOW_VALIDATOR_ROLLUP_RPC_URL"
+    )]
+    pub shadow_validator_rollup_rpc_url: Option<Url>,
+
     /// Parity validator L2 RPC endpoint.
     ///
-    /// The validator's derived block hashes are compared with the sequencer's.
+    /// The validator's derived block hashes are compared with the leader sequencer's.
     #[arg(long = "shadow.validator-l2-rpc-url", env = "BASE_BATCHER_SHADOW_VALIDATOR_L2_RPC_URL")]
     pub shadow_validator_l2_rpc_url: Option<Url>,
 
-    /// L2 block polling interval in seconds.
+    /// Polling interval in seconds of the L2 blocks and the derivation status, and of the
+    /// leader search among several sequencers.
     #[arg(long = "poll-interval", default_value = "1", env = "BASE_BATCHER_POLL_INTERVAL")]
     pub poll_interval_secs: u64,
 
@@ -156,7 +174,7 @@ pub struct BatcherArgs {
     /// DA backlog threshold in bytes at which throttling activates.
     ///
     /// When the estimated unsubmitted DA backlog exceeds this value, the batcher
-    /// pushes lower DA limits to the `--l2-rpc-url` endpoint.
+    /// pushes lower DA limits to the `--sequencer-urls` endpoints.
     #[arg(
         long = "throttle-threshold",
         default_value = "1000000",
@@ -166,8 +184,8 @@ pub struct BatcherArgs {
 
     /// Disable DA throttling.
     ///
-    /// The batcher never pushes DA limits to the `--l2-rpc-url` endpoint, however large its DA
-    /// backlog grows. Required with `--shadow.enabled`.
+    /// The batcher never pushes DA limits to the `--sequencer-urls` endpoints, however large
+    /// its DA backlog grows. Required with `--shadow.enabled`.
     #[arg(long = "no-throttle", env = "BASE_BATCHER_NO_THROTTLE")]
     pub no_throttle: bool,
 
@@ -216,7 +234,8 @@ pub struct BatcherArgs {
     #[arg(long = "stopped", env = "BASE_BATCHER_STOPPED")]
     pub stopped: bool,
 
-    /// Block startup until the rollup node has processed the selected L1 target.
+    /// Block startup until the rollup node whose derivation the batcher follows has
+    /// processed the selected L1 target.
     ///
     /// By default the target is the current L1 head. `--check-recent-txs-depth`
     /// may select an earlier target from the configured window.
@@ -224,7 +243,7 @@ pub struct BatcherArgs {
     pub wait_node_sync: bool,
 
     /// Budget for retrying one-shot startup RPCs, and the maximum seconds to
-    /// wait for the rollup node to report sync when `--wait-node-sync` is set.
+    /// wait for that rollup node to report sync when `--wait-node-sync` is set.
     /// On expiry the service exits with an error rather than hanging
     /// indefinitely. Default: 600 seconds (10 minutes).
     #[arg(
@@ -248,18 +267,22 @@ pub struct BatcherArgs {
 impl BatcherArgs {
     /// Convert CLI arguments into a [`BatcherConfig`].
     pub fn into_config(self, metrics_enabled: bool) -> eyre::Result<BatcherConfig> {
-        // Shadow mode takes all three of its flags, and a canonical batcher none of them.
-        let shadow =
-            match (self.shadow_enabled, self.shadow_inbox, self.shadow_validator_l2_rpc_url) {
-                (true, Some(inbox), Some(validator_l2_rpc_url)) => {
-                    Some(ShadowConfig { inbox, validator_l2_rpc_url })
-                }
-                (false, None, None) => None,
-                _ => eyre::bail!(
-                    "--shadow.enabled, --shadow.inbox and --shadow.validator-l2-rpc-url \
-                     must be set together"
-                ),
-            };
+        // Shadow mode takes all four of its flags, and a canonical batcher none of them.
+        let shadow = match (
+            self.shadow_enabled,
+            self.shadow_inbox,
+            self.shadow_validator_rollup_rpc_url,
+            self.shadow_validator_l2_rpc_url,
+        ) {
+            (true, Some(inbox), Some(validator_rollup_rpc_url), Some(validator_l2_rpc_url)) => {
+                Some(ShadowConfig { inbox, validator_rollup_rpc_url, validator_l2_rpc_url })
+            }
+            (false, None, None, None) => None,
+            _ => eyre::bail!(
+                "--shadow.enabled, --shadow.inbox, --shadow.validator-rollup-rpc-url and \
+                 --shadow.validator-l2-rpc-url must be set together"
+            ),
+        };
 
         let signer = SignerConfig::try_from(self.signer)?;
 
@@ -301,8 +324,7 @@ impl BatcherArgs {
         Ok(BatcherConfig {
             l1_rpc_url: self.l1_rpc_url,
             l1_ws_url: self.l1_ws_url,
-            l2_rpc_url: self.l2_rpc_url,
-            rollup_rpc_url: self.rollup_rpc_url,
+            sequencer_urls: self.sequencer_urls,
             signer: Some(signer),
             metrics_enabled,
             shadow,
@@ -352,9 +374,7 @@ mod tests {
             "batcher",
             "--l1-rpc-url",
             "http://localhost:8545",
-            "--l2-rpc-url",
-            "http://localhost:9545",
-            "--rollup-rpc-url",
+            "--sequencer-urls",
             "http://localhost:7545",
         ]
     }
@@ -388,43 +408,66 @@ mod tests {
         assert_eq!(signer.address(), Address::repeat_byte(0x42));
     }
 
-    /// Any one or two of the three shadow flags are refused with the same message.
+    /// `--sequencer-urls` takes a comma separated list and keeps its order.
+    #[test]
+    fn sequencer_urls_are_comma_separated() {
+        let cli = BatcherArgs::try_parse_from([
+            "batcher",
+            "--l1-rpc-url",
+            "http://localhost:8545",
+            "--sequencer-urls",
+            "http://conductor-0:8547,http://conductor-1:8547",
+            "--private-key",
+            PRIVATE_KEY,
+        ])
+        .expect("CLI should parse");
+        let config = cli.into_config(false).expect("config should build");
+
+        let sequencer_urls: Vec<&str> = config.sequencer_urls.iter().map(Url::as_str).collect();
+        assert_eq!(sequencer_urls, ["http://conductor-0:8547/", "http://conductor-1:8547/"]);
+    }
+
+    /// Any one, two or three of the four shadow flags are refused with the same message.
     #[test]
     fn into_config_requires_the_shadow_flags_together() {
-        let shadow_enabled: &[&str] = &["--shadow.enabled"];
-        let shadow_inbox: &[&str] =
-            &["--shadow.inbox", "0x1111111111111111111111111111111111111111"];
-        let shadow_validator_l2_rpc_url: &[&str] =
-            &["--shadow.validator-l2-rpc-url", "http://validator:9545"];
-        let incomplete = [
-            shadow_enabled.to_vec(),
-            shadow_inbox.to_vec(),
-            shadow_validator_l2_rpc_url.to_vec(),
-            [shadow_enabled, shadow_inbox].concat(),
-            [shadow_enabled, shadow_validator_l2_rpc_url].concat(),
-            [shadow_inbox, shadow_validator_l2_rpc_url].concat(),
+        let shadow_flags: [&[&'static str]; 4] = [
+            &["--shadow.enabled"],
+            &["--shadow.inbox", "0x1111111111111111111111111111111111111111"],
+            &["--shadow.validator-rollup-rpc-url", "http://validator:7545"],
+            &["--shadow.validator-l2-rpc-url", "http://validator:9545"],
         ];
 
-        for flags in incomplete {
+        // Each bit of `subset` keeps one flag. The range leaves out the subset that keeps none
+        // and the one that keeps all four.
+        for subset in 1..(1 << shadow_flags.len()) - 1 {
+            let flags: Vec<&str> = shadow_flags
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| subset & (1 << index) != 0)
+                .flat_map(|(_, flag)| flag.iter().copied())
+                .collect();
+
             let error = parse_cli(&flags).into_config(false).unwrap_err();
 
             assert_eq!(
                 error.to_string(),
-                "--shadow.enabled, --shadow.inbox and --shadow.validator-l2-rpc-url \
-                 must be set together",
+                "--shadow.enabled, --shadow.inbox, --shadow.validator-rollup-rpc-url and \
+                 --shadow.validator-l2-rpc-url must be set together",
                 "{flags:?}"
             );
         }
     }
 
-    /// The three shadow flags together build a `ShadowConfig` holding the given inbox and parity
-    /// validator URL.
+    /// The four shadow flags together build a `ShadowConfig` holding the given inbox and parity
+    /// validator URLs.
     #[test]
     fn into_config_builds_the_shadow_config() {
         let cli = parse_cli(&[
             "--shadow.enabled",
             "--shadow.inbox",
             "0x1111111111111111111111111111111111111111",
+            "--shadow.validator-rollup-rpc-url",
+            "http://validator:7545",
             "--shadow.validator-l2-rpc-url",
             "http://validator:9545",
             "--no-throttle",
@@ -432,6 +475,7 @@ mod tests {
         let shadow = cli.into_config(false).unwrap().shadow.expect("a shadow config");
 
         assert_eq!(shadow.inbox, Address::repeat_byte(0x11));
+        assert_eq!(shadow.validator_rollup_rpc_url.as_str(), "http://validator:7545/");
         assert_eq!(shadow.validator_l2_rpc_url.as_str(), "http://validator:9545/");
     }
 
@@ -543,12 +587,12 @@ mod tests {
         assert!(config.wait_node_sync);
     }
 
-    /// The L1, L2 and rollup RPC flags are each required, so the batcher cannot start without
+    /// The L1 RPC and the sequencer URLs are each required, so the batcher cannot start without
     /// an endpoint to read from.
     #[test]
-    fn cli_requires_each_rpc_url() {
+    fn cli_requires_the_l1_rpc_and_sequencer_urls() {
         let args = base_args();
-        for flag in ["--l1-rpc-url", "--l2-rpc-url", "--rollup-rpc-url"] {
+        for flag in ["--l1-rpc-url", "--sequencer-urls"] {
             let position = args.iter().position(|arg| *arg == flag).unwrap();
             let mut without = args.clone();
             without.drain(position..position + 2);

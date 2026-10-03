@@ -29,10 +29,9 @@ const INITIAL_SAFE_L2_HEAD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub struct InProcessBatcherConfig {
     /// L1 RPC endpoint for batch transaction submission.
     pub l1_rpc_url: Url,
-    /// L2 execution RPC endpoint for reading L2 blocks.
-    pub l2_rpc_url: Url,
-    /// Rollup node RPC endpoint for fetching the rollup config.
-    pub rollup_rpc_url: Url,
+    /// Consensus RPC endpoint of the sequencer, which must forward the methods it does not
+    /// serve to its execution client.
+    pub sequencer_url: Url,
     /// Batcher private key for signing L1 transactions.
     pub batcher_key: B256,
     /// Whether to use short-lived calldata channels for deterministic tests.
@@ -55,14 +54,13 @@ impl std::fmt::Debug for InProcessBatcher {
 impl InProcessBatcher {
     /// Starts an in-process batcher with the given configuration.
     pub async fn start(config: InProcessBatcherConfig) -> Result<Self> {
-        Self::wait_for_initial_safe_l2_head(&config.rollup_rpc_url).await?;
+        Self::wait_for_initial_safe_l2_head(&config.sequencer_url).await?;
 
         let signer = PrivateKeySigner::from_bytes(&config.batcher_key)
             .map_err(|e| eyre::eyre!("invalid batcher key: {e}"))?;
         let mut batcher_config = BatcherConfig {
             l1_rpc_url: config.l1_rpc_url,
-            l2_rpc_url: config.l2_rpc_url,
-            rollup_rpc_url: config.rollup_rpc_url,
+            sequencer_urls: vec![config.sequencer_url],
             signer: Some(SignerConfig::local(signer)),
             // SystemTestStack defaults come from the shared batcher config:
             // poll_interval: 1s, num_confirmations: 1, resubmission_timeout: 48s —

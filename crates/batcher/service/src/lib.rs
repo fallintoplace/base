@@ -37,5 +37,11 @@ pub use throttle::ThrottlePusher;
 mod derivation_status_poller;
 pub use derivation_status_poller::{DerivationStatusPoller, DerivationStatusProvider};
 
+mod sequencers;
+pub use sequencers::{Sequencer, Sequencers};
+
+mod rollup_node;
+pub use rollup_node::RollupNode;
+
 mod service;
 pub use service::{BatcherService, ReadyBatcher};
